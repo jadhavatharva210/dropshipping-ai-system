@@ -1,0 +1,43 @@
+# ── Python ──────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# ── Tests ───────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# ── Secrets ─────────────────────────────────────────────
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# ── Next.js frontend (later milestones) ─────────────────
+node_modules/
+.next/
+out/
+dist/
+*.tsbuildinfo
+
+# ── Alembic ─────────────────────────────────────────────
+alembic/versions/__pycache__/
+
+# ── Editor / OS ─────────────────────────────────────────
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+*.log
