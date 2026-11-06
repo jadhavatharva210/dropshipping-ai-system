@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import or_, select, update
 from sqlalchemy.orm import Session
 
 from app.core.enums import ApprovalStatus, TaskStatus
@@ -58,6 +58,90 @@ class ApprovalService:
             )
 
     @staticmethod
+    def ensure_decidable(db: Session, approval_id: str) -> ApprovalRequest:
+        """Fetch an approval and prove it can still be decided.
+
+        Raises ApprovalNotFoundError / ApprovalAlreadyDecidedError, and flips
+        stale requests to EXPIRED (+ audit) before raising ApprovalExpiredError.
+        Callers must run this BEFORE executing any approved action.
+        """
+        approval = ApprovalService._get_or_raise(db, approval_id)
+        ApprovalService._ensure_pending(approval)
+        ApprovalService._expire_if_stale(db, approval)
+        return approval
+
+    @staticmethod
+    def claim_approval(
+        db: Session, approval_id: str, approver_identity: str
+    ) -> ApprovalRequest:
+        """Atomically claim a PENDING approval as APPROVED, before any execution.
+
+        The conditional UPDATE ... WHERE status = PENDING is the concurrency
+        guard: exactly one caller wins the claim, any other resume gets
+        ApprovalAlreadyDecidedError. Task moves WAITING_APPROVAL -> IN_PROGRESS.
+        """
+        if not approver_identity or not approver_identity.strip():
+            raise ValueError("A non-empty approver_identity is required")
+
+        # Atomic claim: PENDING and still within expiry, checked at claim time.
+        now = utc_now()
+        # SQLite stores DATETIME(timezone=True) as a UTC-naive string, so the
+        # comparison parameter must be naive UTC to compare correctly.
+        now_db = now.replace(tzinfo=None)
+        result = db.execute(
+            update(ApprovalRequest)
+            .where(
+                ApprovalRequest.id == approval_id,
+                ApprovalRequest.status == ApprovalStatus.PENDING,
+                or_(
+                    ApprovalRequest.expires_at.is_(None),
+                    ApprovalRequest.expires_at > now_db,
+                ),
+            )
+            .values(
+                status=ApprovalStatus.APPROVED,
+                approver_identity=approver_identity,
+                decided_at=now,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        if result.rowcount != 1:
+            db.rollback()
+            current = db.get(ApprovalRequest, approval_id)
+            if current is None:
+                raise ApprovalNotFoundError(f"ApprovalRequest {approval_id!r} not found")
+            if current.status == ApprovalStatus.EXPIRED:
+                raise ApprovalExpiredError("Approval request has expired")
+            if current.status == ApprovalStatus.PENDING:
+                # PENDING but past expiry at claim time: flip + audit, then refuse.
+                ApprovalService._expire_if_stale(db, current)
+            raise ApprovalAlreadyDecidedError(
+                f"Approval request already decided (status={current.status.value})"
+            )
+        db.expire_all()
+        approval = db.get(ApprovalRequest, approval_id)
+
+        task = db.get(Task, approval.task_id)
+        if task is not None and task.status == TaskStatus.WAITING_APPROVAL:
+            task.status = TaskStatus.IN_PROGRESS
+
+        AuditService.log_event(
+            db,
+            agent_type=approval.requesting_agent,
+            action_name="approval.approved",
+            permission_level=approval.task.permission_level,
+            status="APPROVED_BY_HUMAN",
+            task_id=approval.task_id,
+            details={
+                "approval_request_id": approval.id,
+                "approver_identity": approver_identity,
+            },
+        )
+        db.commit()
+        db.refresh(approval)
+        return approval
+
+    @staticmethod
     def _expire_if_stale(db: Session, approval: ApprovalRequest) -> None:
         """Mark a stale request EXPIRED + audit it; raises ApprovalExpiredError."""
         if approval.expires_at is not None and _as_utc(approval.expires_at) <= utc_now():
@@ -84,9 +168,7 @@ class ApprovalService:
         approver_identity: str,
         execution_result: dict[str, Any] | None = None,
     ) -> ApprovalRequest:
-        approval = ApprovalService._get_or_raise(db, approval_id)
-        ApprovalService._ensure_pending(approval)
-        ApprovalService._expire_if_stale(db, approval)
+        approval = ApprovalService.ensure_decidable(db, approval_id)
 
         approval.status = ApprovalStatus.APPROVED
         approval.approver_identity = approver_identity
@@ -126,9 +208,7 @@ class ApprovalService:
         if not reason or not reason.strip():
             raise ValueError("A non-empty rejection reason is required")
 
-        approval = ApprovalService._get_or_raise(db, approval_id)
-        ApprovalService._ensure_pending(approval)
-        ApprovalService._expire_if_stale(db, approval)
+        approval = ApprovalService.ensure_decidable(db, approval_id)
 
         approval.status = ApprovalStatus.REJECTED
         approval.approver_identity = approver_identity
