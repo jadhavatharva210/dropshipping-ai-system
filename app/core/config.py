@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -24,6 +26,10 @@ class Settings(BaseSettings):
 
     # Two-way approval model
     default_approval_expiry_minutes: int = 60
+
+    @property
+    def approval_expiry_timedelta(self) -> timedelta:
+        return timedelta(minutes=self.default_approval_expiry_minutes)
 
     @property
     def is_sqlite(self) -> bool:
