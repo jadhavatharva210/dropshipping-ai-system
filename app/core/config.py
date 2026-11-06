@@ -21,8 +21,16 @@ class Settings(BaseSettings):
     # Database: SQLite for local dev, Postgres via DATABASE_URL in production.
     database_url: str = "sqlite:///./dropshipping_dev.db"
 
-    # AI provider: mock | anthropic | openai | gemini
+    # AI provider: mock (default, offline) | openai_compatible (real backend)
     ai_provider: str = "mock"
+
+    # Real-provider settings (used only when ai_provider=openai_compatible).
+    # Any OpenAI-compatible chat-completions API works; defaults target the
+    # free Groq plan. The key comes from the local .env only - never commit it.
+    ai_api_key: str = ""
+    ai_base_url: str = "https://api.groq.com/openai/v1"
+    ai_model: str = "openai/gpt-oss-120b"
+    ai_timeout_seconds: float = 30.0
 
     # Two-way approval model
     default_approval_expiry_minutes: int = 60

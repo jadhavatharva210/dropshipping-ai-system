@@ -7,6 +7,7 @@ validated AgentOutput.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from pydantic import BaseModel
@@ -128,12 +129,27 @@ class AdvertisingAnalyticsAgent(BaseAgent):
         if not ad_copy["executed"]:
             return _gated_output(self.agent_type, task, ad_copy, "Ad copy gated")
 
+        # AI-written ad copy grounded ONLY in supplied product facts - never
+        # invented claims. Facts come from the task input (price_usd, benefits,
+        # target_audience, tone, platform are all optional); with the mock
+        # provider this stays deterministic placeholder output for tests.
+        product_facts: dict[str, Any] = {"product": top_product}
+        for fact_key in ("price_usd", "benefits", "target_audience", "tone", "platform"):
+            if params.get(fact_key) is not None:
+                product_facts[fact_key] = params[fact_key]
+        plan_prompt = (
+            "Write ad copy for this product using ONLY the supplied facts "
+            "below. Do not invent claims, statistics, reviews or discounts "
+            "that are not in the facts.\n\n"
+            f"Supplied facts (JSON):\n{json.dumps(product_facts, default=str)}"
+        )
         plan = ai_provider.generate_structured(
-            f"Ad plan for {top_product}", AdPlan, context={"product": top_product}
+            plan_prompt, AdPlan, context={"product_facts": product_facts}
         )
 
         data: dict[str, Any] = {
             "product": top_product,
+            "product_facts": product_facts,
             "ad_copy": ad_copy["result"],
             "ad_plan": plan.model_dump(),
             "research_source": RESEARCH_NAMESPACE,
