@@ -23,6 +23,7 @@ from pydantic import BaseModel, ConfigDict
 
 from app.api.v1.approvals import router as governance_router
 from app.api.v1.orchestrator import router as orchestrator_router
+from app.api.v1.research import router as research_router
 from app.core.config import (
     API_V1_PREFIX,
     APP_NAME,
@@ -105,6 +106,8 @@ def create_app() -> FastAPI:
     # the orchestrator/ops API. They declare paths relative to /api/v1.
     app.include_router(governance_router, prefix=API_V1_PREFIX)
     app.include_router(orchestrator_router, prefix=API_V1_PREFIX)
+    # Milestone 2B surface: product research opportunity reports (Agent 1).
+    app.include_router(research_router, prefix=API_V1_PREFIX)
     return app
 
 
