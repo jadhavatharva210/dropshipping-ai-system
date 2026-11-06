@@ -28,7 +28,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, TypeAdapter, ValidationError
 from sqlalchemy import Engine, func, inspect, select, text
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import IntegrityError, StatementError
@@ -129,6 +129,18 @@ def test_settings_defaults_match_env_example(field: str, default: Any) -> None:
     assert Settings.model_fields[field].default == default
 
 
+def _parse_documented_value(annotation: Any, raw: str) -> Any:
+    """Coerce a ``.env.example`` string the way pydantic-settings would.
+
+    Environment variables are always strings, so ``AI_TIMEOUT_SECONDS=30`` and
+    a ``float`` default of ``30.0`` describe the same setting. Running the
+    documented value through the field's own annotation makes this check
+    type-aware instead of a naive string comparison - which is what lets
+    Milestone 2A document ``30`` for a float field without a false failure.
+    """
+    return TypeAdapter(annotation).validate_python(raw)
+
+
 def test_env_example_stays_in_sync_with_settings() -> None:
     """Every documented key must exist and agree with the code default."""
     env_example = Path(__file__).resolve().parents[1] / ".env.example"
@@ -141,12 +153,29 @@ def test_env_example_stays_in_sync_with_settings() -> None:
         documented[key.strip().lower()] = value.strip()
 
     assert documented, ".env.example parsed to nothing - check the file format"
-    for key, value in documented.items():
+    for key, raw in documented.items():
         assert key in Settings.model_fields, f"{key.upper()} is not a Settings field"
-        assert str(Settings.model_fields[key].default) == value, (
-            f"{key.upper()}: .env.example documents {value!r} but the code "
-            f"defaults to {Settings.model_fields[key].default!r}"
+        field = Settings.model_fields[key]
+        try:
+            parsed = _parse_documented_value(field.annotation, raw)
+        except ValidationError as exc:
+            raise AssertionError(
+                f"{key.upper()}={raw!r} in .env.example is not valid for "
+                f"its declared type {field.annotation}"
+            ) from exc
+        assert parsed == field.default, (
+            f"{key.upper()}: .env.example documents {raw!r} (parsed {parsed!r}) "
+            f"but the code defaults to {field.default!r}"
         )
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [("30", 30.0), ("30.0", 30.0), ("0.5", 0.5)],
+)
+def test_env_sync_comparison_is_type_aware(raw: str, expected: float) -> None:
+    """Pins the float/int string equivalence the check above relies on."""
+    assert _parse_documented_value(float, raw) == expected
 
 
 def test_settings_loaded_from_process_environment() -> None:

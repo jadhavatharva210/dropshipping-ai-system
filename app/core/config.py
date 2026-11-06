@@ -48,7 +48,13 @@ ENVIRONMENT_CHOICES: tuple[str, ...] = (
     "staging",
     "production",
 )
-AI_PROVIDER_CHOICES: tuple[str, ...] = ("mock", "anthropic", "openai", "gemini")
+AI_PROVIDER_CHOICES: tuple[str, ...] = (
+    "mock",
+    "openai_compatible",
+    "anthropic",
+    "openai",
+    "gemini",
+)
 
 #: Dialect prefixes accepted in ``DATABASE_URL`` (``postgresql+psycopg`` and
 #: friends are matched on their part before the ``+``).
@@ -84,10 +90,30 @@ class Settings(BaseSettings):
     sql_echo: bool = Field(default=False)
 
     # ── AI provider ───────────────────────────────────────────────────────
-    ai_provider: Literal["mock", "anthropic", "openai", "gemini"] = Field(
+    #: ``mock`` is the default: deterministic, offline, zero spend - the whole
+    #: test suite runs on it. ``openai_compatible`` calls any OpenAI-compatible
+    #: chat-completions API (Groq, Gemini's OpenAI endpoint, OpenRouter,
+    #: DeepSeek, ...) configured entirely through the ``ai_*`` settings below.
+    #: ``anthropic`` / ``openai`` / ``gemini`` are reserved: declaring one is
+    #: valid configuration, but ``get_ai_provider()`` raises until implemented.
+    ai_provider: Literal[
+        "mock", "openai_compatible", "anthropic", "openai", "gemini"
+    ] = Field(
         default="mock",
         description="mock = deterministic, offline, zero spend.",
     )
+
+    #: Real-provider settings, read only when ``ai_provider="openai_compatible"``.
+    #: The key comes from the local ``.env`` only - never commit it. ``repr=False``
+    #: keeps it out of ``repr(settings)``, and therefore out of logs, tracebacks
+    #: and any debug endpoint that might ever serialise settings.
+    ai_api_key: str = Field(default="", repr=False)
+    ai_base_url: str = Field(
+        default="https://api.groq.com/openai/v1",
+        description="Any OpenAI-compatible chat-completions base URL.",
+    )
+    ai_model: str = Field(default="openai/gpt-oss-120b")
+    ai_timeout_seconds: float = Field(default=30.0, gt=0)
 
     # ── Two-way approval model ────────────────────────────────────────────
     default_approval_expiry_minutes: int = Field(
