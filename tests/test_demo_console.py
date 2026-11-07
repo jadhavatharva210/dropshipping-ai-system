@@ -262,3 +262,62 @@ def test_fixtures_are_parsed_by_the_real_extractor() -> None:
                 assert page.escalation_reason
     finally:
         service.close()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 6. The one-command launcher
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def test_launcher_works_when_invoked_as_a_script() -> None:
+    """`python demo/run.py` adds `demo/` to sys.path, not the repo root.
+
+    That is exactly how a user will run it, and it is how the "No module named
+    'demo'" failure appeared - so the launcher is exercised as a real script
+    rather than as an import.
+    """
+    import subprocess
+    import sys
+
+    from demo.run import REPO_ROOT
+
+    result = subprocess.run(
+        [sys.executable, str(REPO_ROOT / "demo" / "run.py"), "--help"],
+        capture_output=True,
+        text=True,
+        cwd=REPO_ROOT,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "--port" in result.stdout
+    assert "No module named" not in result.stderr
+
+
+def test_launcher_defaults_are_offline_and_free() -> None:
+    from demo.run import DEFAULTS
+
+    assert DEFAULTS["AI_PROVIDER"] == "mock"
+    assert DEFAULTS["WEB_SEARCH_PROVIDER"] == "none"
+    assert DEFAULTS["APP_ENV"] == "development"
+
+
+def test_launcher_database_path_does_not_depend_on_cwd() -> None:
+    """A run from another directory must not create a second demo database."""
+    from demo.run import DEFAULTS, REPO_ROOT
+
+    url = DEFAULTS["DATABASE_URL"]
+    assert url.startswith("sqlite:////"), url  # absolute: four slashes
+    assert url.endswith("demo_console.db")
+    assert str(REPO_ROOT.as_posix()) in url
+
+
+def test_launcher_reports_a_port_already_in_use() -> None:
+    import socket
+
+    from demo import run as launcher
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as taken:
+        taken.bind(("127.0.0.1", 0))
+        taken.listen(1)
+        port = taken.getsockname()[1]
+        assert launcher._port_is_free(port, "127.0.0.1") is False
+        assert launcher.main(["--port", str(port), "--no-browser"]) == 1
