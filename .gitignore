@@ -57,3 +57,7 @@ alembic/versions/__pycache__/
 Thumbs.db
 desktop.ini
 *.log
+
+# ── Demo console ────────────────────────────────────────
+demo_console.db
+*.db
