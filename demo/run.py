@@ -69,6 +69,50 @@ REQUIRED_MODULES = {
 }
 
 
+def venv_python() -> Path | None:
+    """Path to this project's virtual-environment interpreter, if there is one."""
+    for candidate in (
+        REPO_ROOT / ".venv" / "Scripts" / "python.exe",  # Windows
+        REPO_ROOT / ".venv" / "bin" / "python",          # macOS / Linux
+    ):
+        if candidate.exists():
+            return candidate
+    return None
+
+
+#: Set before the hand-over so a failure to switch cannot loop forever.
+_REEXEC_FLAG = "DROPSHIPPING_LAUNCHER_REEXEC"
+
+
+def ensure_project_interpreter() -> None:
+    """Re-run under ``.venv`` when started with a bare ``python``.
+
+    Typing ``python demo/run.py`` with the venv *not* activated picks up the
+    system interpreter, which has none of the dependencies - and on Windows the
+    same thing happens when activation silently fails. Printing "install the
+    requirements" would then be useless advice: the user already installed them,
+    into the venv. Hand the process over to the project interpreter instead.
+
+    The check is on ``sys.prefix`` rather than on ``sys.executable``, because a
+    venv's interpreter is usually a *symlink* to the system one - comparing
+    resolved paths would wrongly conclude they are the same file.
+    """
+    if os.environ.get(_REEXEC_FLAG):
+        return  # already tried; report the problem instead of looping
+    venv_root = REPO_ROOT / ".venv"
+    if Path(sys.prefix).resolve() == venv_root.resolve():
+        return  # already running inside the project environment
+    candidate = venv_python()
+    if candidate is None:
+        return  # no venv to switch to - let the dependency check explain
+    print(f"Not inside the project virtual environment - switching to {candidate}")
+    os.environ[_REEXEC_FLAG] = "1"
+    os.execv(
+        str(candidate),
+        [str(candidate), str(Path(__file__).resolve()), *sys.argv[1:]],
+    )
+
+
 def missing_dependencies() -> list[str]:
     """Distribution names for every required import that is not installed."""
     return [
@@ -130,6 +174,10 @@ def main(argv: list[str] | None = None) -> int:
         "--reload", action="store_true", help="auto-reload on code changes (dev)"
     )
     args = parser.parse_args(argv)
+
+    # Hand over to the project's virtual environment before anything else, so a
+    # bare `python demo/run.py` behaves like an activated one.
+    ensure_project_interpreter()
 
     # Settings are read at import time, so the environment must be set before
     # anything under `app` or `demo` is imported.

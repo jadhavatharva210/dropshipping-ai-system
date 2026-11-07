@@ -55,6 +55,7 @@ machine). It also opens a browser tab when it can — `--no-browser` skips that,
 | --- | --- | --- |
 | `'source' is not recognized` | that line is for macOS/Linux | on Windows use `.venv\Scripts\Activate.ps1` |
 | `Could not open requirements file` | wrong folder, or the `cd` was skipped | `cd` into the folder that has `requirements.txt`, `app\` and `demo\`, then retry |
+| `Cannot start: ... missing packages` with a system interpreter path | the venv is not active | the launcher switches to `.venv` itself; if it still appears, run `.venv\Scripts\python.exe demo\run.py` |
 | `running scripts is disabled` | PowerShell execution policy | `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass` |
 | `No module named 'demo'` | old copy of `demo/run.py` | update the branch — the launcher adds the repo root to `sys.path` now |
 | `Port 8000 is already in use` | something else is on 8000 | `python demo\run.py --port 8001` |

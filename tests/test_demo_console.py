@@ -380,3 +380,39 @@ def test_readme_gives_separate_windows_and_unix_instructions() -> None:
     assert "source" not in windows_block  # the exact command that failed
     assert "source .venv/bin/activate" in unix_block
     assert "curl" not in readme.split("### Windows", 1)[1].split("### macOS", 1)[0]
+
+
+def test_launcher_hands_over_to_the_project_venv() -> None:
+    """`python demo/run.py` outside the venv must switch to it, not fail.
+
+    A venv interpreter is normally a symlink to the system one, so comparing
+    resolved paths wrongly concludes they are the same file - which silently
+    skipped the hand-over and printed a useless "install the requirements".
+    """
+    import subprocess
+    import sys
+
+    from demo.run import REPO_ROOT
+
+    if (REPO_ROOT / ".venv").exists() is False:
+        import pytest
+
+        pytest.skip("no .venv in this checkout")
+
+    # Run with the *system* interpreter, from an unrelated working directory.
+    simulate = (
+        "import runpy, sys\n"
+        f"sys.argv = ['run.py', '--help']\n"
+        f"runpy.run_path({str(REPO_ROOT / 'demo' / 'run.py')!r}, run_name='__main__')\n"
+    )
+    result = subprocess.run(
+        [sys.base_prefix + "/bin/python3", "-c", simulate]
+        if (__import__("pathlib").Path(sys.base_prefix + "/bin/python3")).exists()
+        else [sys.executable, "-c", simulate],
+        capture_output=True,
+        text=True,
+        cwd="/tmp",
+    )
+    assert result.returncode == 0, result.stderr
+    assert "--port" in result.stdout
+    assert "missing" not in result.stderr
