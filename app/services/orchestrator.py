@@ -3,10 +3,24 @@
 Runs child tasks in order through the AgentRegistry, persists outputs,
 honours Level 2 / Level 3 gates by pausing or blocking cleanly, retries
 transient agent failures, and resumes gated workflows after human approval.
+
+Provider ownership
+------------------
+The orchestrator builds an :class:`AIProvider` when none is injected. A real
+provider owns an ``httpx.Client`` connection pool, so whoever *created* the
+provider has to release it. That ownership is tracked explicitly in
+``_owns_provider``: :meth:`MainOrchestrator.close` closes only a provider the
+orchestrator built itself, and is a no-op when the caller injected one (the
+caller then owns it). The class is also a context manager, so the common
+per-request pattern cannot leak a pool::
+
+    with MainOrchestrator() as orchestrator:
+        orchestrator.run_workflow(db, objective="...")
 """
 
 from __future__ import annotations
 
+import types
 from typing import Any
 
 from sqlalchemy import select
@@ -40,8 +54,45 @@ class MainOrchestrator:
         self.tool_registry = tool_registry or create_default_registry()
         self.agent_registry = agent_registry or create_default_agent_registry()
         self.memory = memory or SharedMemoryService()
+        # Ownership flag: only a provider this orchestrator created is closed
+        # by close(). An injected provider belongs to the caller.
+        self._owns_provider = ai_provider is None
         self.ai_provider = ai_provider or get_ai_provider()
         self.max_retries = max_retries
+        self._closed = False
+
+    # ── lifecycle ─────────────────────────────────────────────────────────
+
+    @property
+    def owns_provider(self) -> bool:
+        """True when this orchestrator created (and must close) its provider."""
+        return self._owns_provider
+
+    def close(self) -> None:
+        """Release the provider if - and only if - this orchestrator owns it.
+
+        Idempotent: a second call is a no-op. Injected providers are left
+        untouched, because closing someone else's client would break the
+        caller's next request.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        if self._owns_provider:
+            self.ai_provider.close()
+
+    def __enter__(self) -> MainOrchestrator:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: types.TracebackType | None,
+    ) -> None:
+        # Always release the pool - on success, on failure and on an exception
+        # raised inside the block.
+        self.close()
 
     # ── workflow execution ────────────────────────────────────────────────
 

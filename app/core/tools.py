@@ -577,6 +577,318 @@ def _generate_product_content(parameters: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# ── Phase 3: advertising & analytics tools (Agent 2) ──────────────────────
+#
+# Same rule as Agent 1's adapters: never fabricate. Every string these produce
+# restates a supplied fact, and a fact that was not supplied is left out (with
+# a note saying so) rather than filled in with a plausible invention. An
+# invented discount or a made-up review is exactly what the spec forbids, so a
+# discount benchmark only appears when the caller supplied one.
+
+#: Campaign-flow benchmark used to size a budget when the caller supplied no
+#: daily budget. Deliberately a plain, documented default and not a claim about
+#: this product's performance.
+DEFAULT_PLATFORMS: tuple[str, ...] = ("meta", "tiktok")
+
+#: Creative formats the brief generator can produce, in preference order.
+_CREATIVE_FORMATS: tuple[tuple[str, str], ...] = (
+    ("UGC_VIDEO", "Shot on a phone, first-person, unpolished."),
+    ("STATIC_IMAGE", "Single product hero image with a short overlay hook."),
+    ("CAROUSEL", "Sequential frames that walk through one benefit each."),
+)
+
+
+def _facts_bundle(parameters: dict[str, Any]) -> dict[str, Any]:
+    """The facts a brief/copy tool is allowed to use, from the caller's bundle."""
+    facts = parameters.get("facts")
+    return dict(facts) if isinstance(facts, dict) else {}
+
+
+def _optional_str_list(raw: Any) -> list[str]:
+    """Coerce a list-ish input into stripped, non-empty strings."""
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple, set)):
+        return []
+    return [str(item).strip() for item in raw if str(item).strip()]
+
+
+def _prepare_creative_briefs(parameters: dict[str, Any]) -> dict[str, Any]:
+    """Structured creative briefs + audience segments, from supplied facts only.
+
+    Deterministic: the same facts always produce the same briefs. Each brief
+    names the facts it rests on, and every brief carries the compliance notes
+    that apply to *this* product - including an explicit "do not advertise a
+    discount" note, because none was supplied.
+    """
+    facts = _facts_bundle(parameters)
+    name = str(
+        facts.get("product_name") or parameters.get("product_name") or "the product"
+    ).strip() or "the product"
+
+    price = _as_optional_float(facts.get("recommended_selling_price_usd"))
+    margin = _as_optional_float(facts.get("estimated_gross_margin_pct"))
+    days_min = facts.get("shipping_days_min") or 0
+    days_max = facts.get("shipping_days_max") or 0
+    in_stock = _as_optional_bool(facts.get("in_stock"))
+    cost_provenance = _declared_provenance(
+        facts.get("cost_provenance", DataProvenance.SIMULATED.value)
+    )
+    price_provenance = _declared_provenance(
+        facts.get("price_provenance", DataProvenance.SIMULATED.value)
+    )
+    benefits = _optional_str_list(parameters.get("benefits") or facts.get("benefits"))
+    platforms = _optional_str_list(
+        parameters.get("platforms") or facts.get("platforms") or facts.get("platform")
+    ) or list(DEFAULT_PLATFORMS)
+    pain_points = _optional_str_list(
+        parameters.get("pain_points") or facts.get("pain_points")
+    )
+    interests = _optional_str_list(parameters.get("interests") or facts.get("interests"))
+
+    # ── compliance notes: only the caveats these facts actually imply ─────
+    compliance: list[str] = []
+    if cost_provenance is not DataProvenance.VERIFIED:
+        compliance.append(
+            f"Costs are {describe_provenance(cost_provenance)}: do not state a landed "
+            f"cost or a profit figure as fact in the ad."
+        )
+    if price_provenance is not DataProvenance.VERIFIED:
+        compliance.append(
+            f"Price is {describe_provenance(price_provenance)}: show it as the current "
+            f"offer only if the store is actually selling at that price."
+        )
+    if in_stock is None:
+        compliance.append(
+            "Stock availability is unconfirmed: do not claim 'in stock' or promise a "
+            "delivery date that the supplier has not committed to."
+        )
+    elif in_stock is False:
+        compliance.append(
+            "Supplier reported out of stock: do not launch this concept until "
+            "availability is confirmed."
+        )
+    compliance.append(
+        "No discount, coupon, free-shipping offer, star rating, review, testimonial or "
+        "guarantee was supplied - none may appear in the creative."
+    )
+
+    # ── audience segment: a hypothesis built from supplied facts ──────────
+    segment_pain_points = pain_points
+    segments = [
+        {
+            "segment_name": str(
+                parameters.get("target_audience")
+                or facts.get("target_audience")
+                or f"Broad cold audience for {name}"
+            ).strip(),
+            "age_range": str(parameters.get("age_range") or facts.get("age_range") or "").strip(),
+            "interests": interests,
+            "pain_points": segment_pain_points,
+            "platforms": platforms,
+        }
+    ]
+
+    # ── briefs: one per supplied benefit (or one generic if none) ─────────
+    messages: list[tuple[str, str]] = []
+    for index, benefit in enumerate(benefits[:3], start=1):
+        messages.append((f"Benefit-led concept {index}", benefit))
+    if margin is not None and margin >= STRONG_MARGIN_PCT:
+        messages.append(
+            (
+                "Value concept",
+                f"An estimated {margin:.1f}% gross margin leaves room for a paid-offer "
+                f"test; costs are {describe_provenance(cost_provenance)}.",
+            )
+        )
+    if not messages:
+        messages.append(
+            (
+                "Product-led concept",
+                f"Introduce {name} using only the supplied facts; no benefit claims were "
+                f"supplied.",
+            )
+        )
+
+    briefs: list[dict[str, Any]] = []
+    for index, (concept_name, key_message) in enumerate(messages):
+        format_type, format_note = _CREATIVE_FORMATS[index % len(_CREATIVE_FORMATS)]
+        facts_referenced = ["product_name"]
+        if price is not None:
+            facts_referenced.append("recommended_selling_price_usd")
+        if days_min and days_max:
+            facts_referenced.append("shipping_days_min/shipping_days_max")
+        if benefits:
+            facts_referenced.append("benefits")
+        shot_list = [
+            f"Open on the product: {name}.",
+            f"Hook: {key_message}",
+            "Show the product in use, exactly as the supplied facts describe it.",
+        ]
+        if days_min and days_max:
+            shot_list.append(
+                f"Overlay the quoted shipping window, {days_min}-{days_max} days, as a "
+                f"stated range - never as a promise."
+            )
+        # Deliberately phrased without naming forbidden claims: this list is
+        # scanned by the same grounding gate as ad copy, so a negated mention
+        # ("no discount overlay") would itself be flagged. The prohibitions live
+        # in `compliance_notes`, which is the field meant for them.
+        shot_list.append(
+            "Close on the call to action with only the supplied facts on screen."
+        )
+        briefs.append(
+            {
+                "concept_name": concept_name,
+                "format_type": format_type,
+                "visual_hook": key_message,
+                "key_message": key_message,
+                "shot_list": shot_list,
+                "compliance_notes": compliance + [format_note],
+                "facts_referenced": facts_referenced,
+            }
+        )
+
+    return {
+        "product_name": name,
+        "target_audiences": segments,
+        "creative_briefs": briefs,
+        "facts_used": facts,
+        "source": "deterministic grounded brief builder",
+        "note": (
+            "Briefs restate supplied facts only. Interests, pain points and platforms "
+            "are empty where the caller supplied none; nothing was invented to fill them."
+        ),
+    }
+
+
+def _analyze_campaign_performance(parameters: dict[str, Any]) -> dict[str, Any]:
+    """Compute the derived metrics and diagnose the campaign - deterministically.
+
+    Accepts an explicit ``metrics`` mapping (an already-built row) or the raw
+    numbers at the top level. Returns ``health_status = NO_DATA`` when nothing
+    was supplied, which is the pre-launch case, not a failure.
+    """
+    from app.schemas.advertising import (  # local import: keeps cycles impossible
+        CampaignObjective,
+        CampaignPerformanceMetrics,
+        build_conversion_analysis,
+        diagnose_campaign_health,
+    )
+
+    raw = parameters.get("metrics")
+    metrics_payload: dict[str, Any] = dict(raw) if isinstance(raw, dict) else {}
+
+    def pick(key: str, default: Any = None) -> Any:
+        if metrics_payload.get(key) is not None:
+            return metrics_payload[key]
+        return parameters.get(key, default)
+
+    impressions = _as_optional_float(pick("impressions"))
+    clicks = _as_optional_float(pick("clicks"))
+    spend = _as_optional_float(pick("spend_usd"))
+    conversions = _as_optional_float(pick("conversions"))
+    revenue = _as_optional_float(pick("revenue_usd"))
+
+    supplied = [impressions, clicks, spend, conversions, revenue]
+    provenance = _declared_provenance(
+        pick("provenance", parameters.get("metrics_provenance"))
+        or DataProvenance.SIMULATED.value
+    )
+
+    if all(value is None for value in supplied):
+        health = diagnose_campaign_health(None)
+        analysis = build_conversion_analysis(health, None)
+        return {
+            "metrics": None,
+            "health_status": health.value,
+            "bottleneck_stage": analysis.bottleneck_stage,
+            "summary": analysis.summary,
+            "recommended_optimizations": analysis.recommended_optimizations,
+            "source": "deterministic campaign analyser (no metrics supplied)",
+            "note": (
+                "No campaign metrics were supplied, so this is pre-launch mode. No "
+                "performance was inferred."
+            ),
+        }
+
+    selling_price = _as_optional_float(
+        pick("selling_price_usd", parameters.get("selling_price_usd"))
+    )
+    landed_cost = _as_optional_float(
+        pick("landed_cost_usd", parameters.get("landed_cost_usd"))
+    )
+
+    metrics = CampaignPerformanceMetrics.compute(
+        impressions=int(impressions or 0),
+        clicks=int(clicks or 0),
+        spend_usd=float(spend or 0.0),
+        conversions=int(conversions or 0),
+        revenue_usd=float(revenue or 0.0),
+        provenance=provenance,
+        selling_price_usd=selling_price if selling_price and selling_price > 0 else None,
+        landed_cost_usd=landed_cost if landed_cost is not None and landed_cost >= 0 else None,
+    )
+
+    health = diagnose_campaign_health(metrics)
+    objective_raw = pick("campaign_objective", parameters.get("campaign_objective"))
+    try:
+        objective = CampaignObjective(str(objective_raw).strip().upper())
+    except (ValueError, AttributeError):
+        objective = CampaignObjective.CONVERSIONS
+    analysis = build_conversion_analysis(health, metrics, objective=objective)
+
+    return {
+        "metrics": metrics.model_dump(mode="json"),
+        "health_status": health.value,
+        "bottleneck_stage": analysis.bottleneck_stage,
+        "summary": analysis.summary,
+        "recommended_optimizations": analysis.recommended_optimizations,
+        "break_even_roas_basis": (
+            "contribution break-even: selling_price / gross_profit per unit, "
+            "before fixed overhead"
+        ),
+        "source": "deterministic campaign analyser",
+        "note": (
+            "Every rate is derived from the supplied raw metrics; nothing was "
+            "estimated. break_even_roas is contribution break-even, not an "
+            "accounting break-even for the business."
+        ),
+    }
+
+
+def _allocate_ad_budget(parameters: dict[str, Any]) -> dict[str, Any]:
+    """Level 2 gated budget allocation (mock - only runs after approval).
+
+    The handler is never reached without an approved ``allocate_ad_budget``
+    action; when it is reached the allocation is recorded as a mock so no real
+    money moves.
+    """
+    daily = _as_optional_float(parameters.get("daily_budget_usd")) or 0.0
+    days = int(_as_optional_float(parameters.get("test_duration_days")) or 7)
+    allocation_raw = parameters.get("allocation_by_platform")
+    allocation = (
+        {str(key): round(float(value), 2) for key, value in allocation_raw.items()}
+        if isinstance(allocation_raw, dict)
+        else {platform: round(daily * days / len(DEFAULT_PLATFORMS), 2) for platform in DEFAULT_PLATFORMS}
+    )
+    return {
+        "allocation_id": "mock-allocation-001",
+        "status": "allocated",
+        "daily_budget_usd": round(daily, 2),
+        "test_duration_days": days,
+        "total_planned_spend_usd": round(daily * days, 2),
+        "allocation_by_platform": allocation,
+        "mock": True,
+        "note": (
+            "Mock allocation executed after explicit human approval. No real ad "
+            "account was touched and no funds were moved."
+        ),
+    }
+
+
 def create_default_registry() -> ToolRegistry:
     registry = ToolRegistry()
     registry.register(ToolDefinition(
@@ -633,6 +945,35 @@ def create_default_registry() -> ToolRegistry:
         description="Publish a live ad campaign (mock, Level 2 approval)",
         allowed_agents={AgentType.ADVERTISING_ANALYTICS},
         handler=_mock_publish_ad_campaign,
+    ))
+    registry.register(ToolDefinition(
+        name="prepare_creative_briefs",
+        action_name="prepare_creative_brief",
+        description=(
+            "Build structured creative briefs and audience segments grounded strictly "
+            "in supplied product facts"
+        ),
+        allowed_agents={AgentType.ADVERTISING_ANALYTICS},
+        handler=_prepare_creative_briefs,
+    ))
+    registry.register(ToolDefinition(
+        name="analyze_campaign_performance",
+        action_name="analyze_campaign_metrics",
+        description=(
+            "Derive CTR/CPC/CPA/CVR/ROAS and contribution break-even from raw campaign "
+            "metrics, then diagnose campaign health deterministically"
+        ),
+        allowed_agents={AgentType.ADVERTISING_ANALYTICS},
+        handler=_analyze_campaign_performance,
+    ))
+    registry.register(ToolDefinition(
+        name="allocate_ad_budget",
+        action_name="allocate_ad_budget",
+        description=(
+            "Allocate an approved ad budget across platforms (mock, Level 2 approval)"
+        ),
+        allowed_agents={AgentType.ADVERTISING_ANALYTICS},
+        handler=_allocate_ad_budget,
     ))
     registry.register(ToolDefinition(
         name="mock_order_tracker",

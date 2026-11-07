@@ -21,6 +21,7 @@ from contextlib import asynccontextmanager
 from fastapi import APIRouter, FastAPI
 from pydantic import BaseModel, ConfigDict
 
+from app.api.v1.advertising import router as advertising_router
 from app.api.v1.approvals import router as governance_router
 from app.api.v1.orchestrator import router as orchestrator_router
 from app.api.v1.research import router as research_router
@@ -108,6 +109,8 @@ def create_app() -> FastAPI:
     app.include_router(orchestrator_router, prefix=API_V1_PREFIX)
     # Milestone 2B surface: product research opportunity reports (Agent 1).
     app.include_router(research_router, prefix=API_V1_PREFIX)
+    # Phase 3 surface: marketing strategy reports and campaign analysis (Agent 2).
+    app.include_router(advertising_router, prefix=API_V1_PREFIX)
     return app
 
 
