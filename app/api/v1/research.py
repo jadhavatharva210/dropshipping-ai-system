@@ -13,6 +13,19 @@ Two endpoints over the same agent the orchestrator already runs:
 Neither endpoint fabricates a result: when the agent refuses to invent a price
 or a supplier cost, or when the AI provider fails, the task's real outcome is
 surfaced as an error instead of an empty report.
+
+Live research (Phase 3.5)
+-------------------------
+``supplier_urls`` / ``competitor_urls`` let a caller point the agent at real
+product pages. Their structured prices (JSON-LD ``Product``/``Offer`` or
+``price`` meta tags) become ``VERIFIED`` figures attributed to the source URL.
+Nothing is fetched unless the caller supplies a URL, so the offline behaviour of
+this endpoint is unchanged.
+
+Provider ownership
+------------------
+The orchestrator is created per request and used through ``with``, so a provider
+it created is always closed and one injected by a caller/test never is.
 """
 
 from __future__ import annotations
@@ -59,18 +72,18 @@ def create_opportunity_report(
     }
 
     orchestrator = _orchestrator()
-    try:
+    # `with` -> MainOrchestrator.close() runs on success *and* on failure, and
+    # it closes only a provider the orchestrator itself created (releasing a
+    # real provider's httpx pool). Closing an injected provider here would break
+    # the caller that owns it - which is exactly what the previous explicit
+    # `orchestrator.ai_provider.close()` did.
+    with orchestrator:
         workflow = orchestrator.run_workflow(
             db,
             objective=payload.objective,
             workflow_type="custom",
             parameters=parameters,
         )
-    finally:
-        # This endpoint constructed the orchestrator, so it owns the provider:
-        # close() releases a real provider's httpx connection pool (no-op for
-        # the mock). Without it every request would leak one.
-        orchestrator.ai_provider.close()
 
     children = workflow.get("children") or []
     if not children:

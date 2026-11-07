@@ -28,6 +28,7 @@ __all__ = [
     "ARCHITECTURE_PHASE",
     "ENVIRONMENT_CHOICES",
     "Settings",
+    "WEB_SEARCH_PROVIDER_CHOICES",
     "get_settings",
     "settings",
 ]
@@ -41,6 +42,12 @@ API_V1_PREFIX: str = "/api/v1"
 #: Reported by ``GET /api/v1/health`` so a running instance can always be
 #: identified without reading the source tree.
 ARCHITECTURE_PHASE: str = "1A-foundation"
+
+#: How live web research may discover candidate product URLs.
+#: ``none``      never touches the network for search (the default);
+#: ``duckduckgo`` parses the public HTML endpoint - no key, no cost;
+#: ``custom``    calls a JSON API named by ``WEB_SEARCH_ENDPOINT``.
+WEB_SEARCH_PROVIDER_CHOICES: tuple[str, ...] = ("none", "duckduckgo", "custom")
 
 ENVIRONMENT_CHOICES: tuple[str, ...] = (
     "development",
@@ -103,6 +110,26 @@ class Settings(BaseSettings):
         description="mock = deterministic, offline, zero spend.",
     )
 
+    # ── Live web research (Phase 3.5: Agent 1 page extraction) ────────────
+    #: Timeout for one product-page fetch. Short by default: a slow merchant
+    #: must not hold a research task open, and there is no headless browser
+    #: here to wait on - one HTTP GET plus stdlib parsing is all it takes.
+    web_research_timeout_seconds: float = Field(default=10.0, gt=0)
+    #: Search backend for candidate URLs. ``none`` is the safe default: with it
+    #: no search request is ever made and the agent falls back to the offline
+    #: discovery adapter rather than inventing URLs.
+    web_search_provider: Literal["none", "duckduckgo", "custom"] = Field(
+        default="none",
+        description="none = never search; duckduckgo = keyless HTML; custom = JSON API.",
+    )
+    #: Only used by ``custom``. ``repr=False`` keeps it out of logs, tracebacks
+    #: and any settings dump - same rule as ``AI_API_KEY``.
+    web_search_api_key: str = Field(default="", repr=False)
+    web_search_endpoint: str = Field(
+        default="",
+        description="JSON search API URL, required when WEB_SEARCH_PROVIDER=custom.",
+    )
+
     #: Real-provider settings, read only when ``ai_provider="openai_compatible"``.
     #: The key comes from the local ``.env`` only - never commit it. ``repr=False``
     #: keeps it out of ``repr(settings)``, and therefore out of logs, tracebacks
@@ -137,6 +164,11 @@ class Settings(BaseSettings):
     @field_validator("ai_provider", mode="before")
     @classmethod
     def _normalise_ai_provider(cls, value: Any) -> str:
+        return str(value).strip().lower()
+
+    @field_validator("web_search_provider", mode="before")
+    @classmethod
+    def _normalise_web_search_provider(cls, value: Any) -> str:
         return str(value).strip().lower()
 
     @field_validator("database_url", mode="before")

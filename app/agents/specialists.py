@@ -46,6 +46,7 @@ from app.schemas.product_research import (
     describe_provenance,
 )
 from app.services.memory import SharedMemoryService
+from app.services.web_research import WebResearchService
 
 #: Cross-agent handoff namespace. `AdvertisingAnalyticsAgent` reads this exact
 #: namespace/key pair, so it must not change: the downstream marketing step
@@ -249,8 +250,16 @@ def _build_risks(
     margin: MarginAnalysis,
     best_supplier: SupplierOption,
     demand_provenance: DataProvenance,
+    unpriced_urls: list[dict[str, Any]] | None = None,
+    live_quotes_used: bool = False,
 ) -> list[str]:
-    """Deterministic risk list: every caveat the provenance actually implies."""
+    """Deterministic risk list: every caveat the provenance actually implies.
+
+    ``unpriced_urls`` carries the pages that were fetched but declared no
+    structured price. That is a *fact* about the research (the page was read and
+    did not publish a price), so it belongs in the report rather than being
+    silently dropped.
+    """
     risks: list[str] = []
 
     if margin.cost_provenance is not DataProvenance.VERIFIED:
@@ -287,6 +296,19 @@ def _build_risks(
             "Demand signal is not from a verified source; no real search volume or sales "
             "data was consulted."
         )
+    if unpriced_urls:
+        listed = ", ".join(str(entry.get("url")) for entry in unpriced_urls[:3])
+        risks.append(
+            f"{len(unpriced_urls)} fetched page(s) declared no structured price and were "
+            f"not used as a quote ({listed}). A page has to publish a price in schema "
+            f"markup or a price meta tag before it counts as evidence."
+        )
+    if live_quotes_used:
+        risks.append(
+            "At least one cost is the price published on a live supplier page, not a "
+            "wholesale quote: confirm per-unit and shipping terms with the supplier "
+            "before ordering."
+        )
 
     if not risks:
         risks.append(
@@ -294,6 +316,183 @@ def _build_risks(
             "fees, returns and refunds are not modelled here."
         )
     return risks
+
+
+def _url_list(raw: Any) -> list[str]:
+    """Coerce a URL input into a de-duplicated list of trimmed strings."""
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple, set)):
+        return []
+    ordered: list[str] = []
+    for item in raw:
+        text = str(item).strip()
+        if text and text not in ordered:
+            ordered.append(text)
+    return ordered
+
+
+def live_service_parameters(params: dict[str, Any]) -> dict[str, Any]:
+    """Carry an injected :class:`WebResearchService` into the live tools.
+
+    The orchestrator runs agents through a shared ``ToolRegistry``, so the only
+    channel from a caller to a tool handler is the parameter dict. Tests inject
+    a service built on an ``httpx.MockTransport`` here; production passes
+    nothing and the tool builds one from ``Settings``.
+    """
+    service = params.get("web_research_service")
+    if isinstance(service, WebResearchService):
+        return {"web_research_service": service}
+    return {}
+
+
+def _live_raw_snapshot(tool_result: dict[str, Any]) -> dict[str, Any]:
+    """The parts of a live-tool result worth keeping in the report receipt."""
+    keys = (
+        "suppliers",
+        "competitors",
+        "pages_fetched",
+        "verified_price_count",
+        "unpriced_urls",
+        "blocked_urls",
+        "source",
+        "note",
+    )
+    return {key: tool_result[key] for key in keys if key in tool_result}
+
+
+def _live_product_urls(tool_result: dict[str, Any]) -> list[dict[str, Any]]:
+    """The per-page records a live tool reported (suppliers and competitors)."""
+    records: list[dict[str, Any]] = []
+    for key in ("suppliers", "competitors", "observations"):
+        for entry in tool_result.get(key) or []:
+            if isinstance(entry, dict):
+                records.append(entry)
+    return records
+
+
+def _merge_live_supplier_quotes(
+    *,
+    live_result: dict[str, Any],
+    caller_quotes: list[Any],
+    live_urls: list[str],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Fold live extractions and caller quotes into one supplier-quote list.
+
+    Two rules keep this honest:
+
+    * A caller-supplied quote for a URL that was also fetched live is
+      **replaced** by the page's own claim, not averaged with it. The page is
+      the primary source; mixing an estimate into a verified price would make
+      the blended figure unverifiable while still calling it VERIFIED.
+    * A live page that yielded no structured price contributes **no quote**.
+      It is returned separately in ``unpriced`` so the reason travels with the
+      result instead of vanishing.
+
+    Landing a page's retail price as a supplier cost is a real assumption, so
+    every live quote is labelled with what was actually read
+    (``quoted_from_live_page``) rather than being presented as a wholesale quote.
+    """
+    quotes: list[dict[str, Any]] = [
+        dict(entry) for entry in (caller_quotes or []) if isinstance(entry, dict)
+    ]
+    fetched = {
+        str(entry.get("source_reference") or "").strip()
+        for entry in live_result.get("suppliers") or []
+        if isinstance(entry, dict)
+    }
+    # Caller quotes that duplicate a fetched URL give way to the page itself.
+    quotes = [
+        quote
+        for quote in quotes
+        if str(quote.get("source_reference") or "").strip() not in fetched
+    ]
+
+    unpriced: list[dict[str, Any]] = []
+    for entry in live_result.get("suppliers") or []:
+        if not isinstance(entry, dict):
+            continue
+        price = _first_float(entry.get("unit_cost_usd"))
+        source = str(entry.get("source_reference") or "").strip()
+        if price is None:
+            unpriced.append(
+                {
+                    "url": source or str(entry.get("url") or ""),
+                    "reason": entry.get("escalation_reason")
+                    or "the page declared no structured price",
+                }
+            )
+            continue
+        quotes.append(
+            {
+                "supplier_name": str(
+                    entry.get("supplier_name") or entry.get("product_name") or source
+                ),
+                "unit_cost_usd": price,
+                "shipping_cost_usd": 0.0,
+                "shipping_days_min": 0,
+                "shipping_days_max": 0,
+                "in_stock": entry.get("in_stock"),
+                "provenance": entry.get("provenance") or DataProvenance.ESTIMATED.value,
+                "source_reference": source or "live product page",
+                "read_from": "quoted_from_live_page",
+                "currency": entry.get("currency") or "",
+                "extraction_source": entry.get("extraction_source") or "",
+            }
+        )
+    return quotes, unpriced
+
+
+def _merge_live_competitor_observations(
+    *,
+    search_result: dict[str, Any],
+    caller_observations: list[Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Fold live competitor observations and caller observations into one list.
+
+    Observations are additive here (unlike supplier quotes): a caller's observed
+    price and a fetched page's price can both be real, and the landscape tool
+    prices off the median of everything observed. Live observations win only
+    when they duplicate the same URL.
+    """
+    observations: list[dict[str, Any]] = [
+        dict(entry) for entry in (caller_observations or []) if isinstance(entry, dict)
+    ]
+    live_urls = {
+        str(entry.get("source_reference") or "").strip()
+        for entry in search_result.get("observations") or []
+        if isinstance(entry, dict)
+    }
+    observations = [
+        entry
+        for entry in observations
+        if str(entry.get("source_reference") or "").strip() not in live_urls
+    ]
+
+    unpriced = list(search_result.get("unpriced_urls") or [])
+    for entry in search_result.get("observations") or []:
+        if not isinstance(entry, dict):
+            continue
+        price = _first_float(entry.get("observed_price_usd"))
+        source = str(entry.get("source_reference") or "").strip()
+        if price is None:
+            continue
+        observations.append(
+            {
+                "competitor_name": str(
+                    entry.get("competitor_name") or entry.get("product_name") or source
+                ),
+                "observed_price_usd": price,
+                "market_positioning": "",
+                "provenance": entry.get("provenance") or DataProvenance.ESTIMATED.value,
+                "source_reference": source or "live competitor page",
+                "read_from": "observed_on_live_page",
+                "currency": entry.get("currency") or "",
+            }
+        )
+    return observations, unpriced
 
 
 class ProductResearchAgent(BaseAgent):
@@ -367,6 +566,89 @@ class ProductResearchAgent(BaseAgent):
             params.get("target_selling_price_usd"),
         )
 
+        # ── 1b. Live web extraction (only when URLs were supplied) ─────────
+        # No URLs means no request: the offline path is unchanged, so nothing
+        # in this milestone silently starts touching the network.
+        supplier_urls = _url_list(params.get("supplier_urls"))
+        competitor_urls = _url_list(params.get("competitor_urls"))
+        live_result: dict[str, Any] = {}
+        search_result: dict[str, Any] = {}
+        live_raw: dict[str, Any] = {}
+        if supplier_urls:
+            live_call = tool_registry.execute_tool(
+                db,
+                tool_name="fetch_live_product_page",
+                task_id=task.id,
+                agent_type=self.agent_type,
+                parameters={
+                    "supplier_urls": supplier_urls,
+                    "competitor_urls": competitor_urls,
+                    **live_service_parameters(params),
+                },
+                context_summary=task.objective,
+            )
+            gated = self._gate(task, live_call, "Live product page fetch gated")
+            if gated is not None:
+                return gated
+            live_result = dict(live_call["result"] or {})
+            live_raw = _live_raw_snapshot(live_result)
+        if competitor_urls or params.get("search_competitors"):
+            search_call = tool_registry.execute_tool(
+                db,
+                tool_name="search_live_competitors",
+                task_id=task.id,
+                agent_type=self.agent_type,
+                parameters={
+                    "query": params.get("search_query") or product_name,
+                    "competitor_urls": competitor_urls,
+                    "max_results": params.get("max_results") or 5,
+                    **live_service_parameters(params),
+                },
+                context_summary=task.objective,
+            )
+            gated = self._gate(task, search_call, "Live competitor search gated")
+            if gated is not None:
+                return gated
+            search_result = dict(search_call["result"] or {})
+            if not live_result:
+                # The search tool reads the competitor pages itself; keep what
+                # it saw available for the report receipt.
+                live_raw = {}
+
+        supplier_quotes, unpriced_supplier_urls = _merge_live_supplier_quotes(
+            live_result=live_result,
+            caller_quotes=list(params.get("suppliers") or []),
+            live_urls=supplier_urls,
+        )
+        competitor_observations, unpriced_competitor_urls = (
+            _merge_live_competitor_observations(
+                search_result=search_result,
+                caller_observations=list(params.get("competitors") or []),
+            )
+        )
+
+        # A caller who supplied supplier URLs asked for *those* pages. If none
+        # of them published a structured price, falling back to the simulated
+        # tiers would answer a different question than the one asked - and would
+        # report simulated costs as if they described the links. Refuse instead.
+        live_supplier_quotes = [
+            quote
+            for quote in supplier_quotes
+            if quote.get("read_from") == "quoted_from_live_page"
+        ]
+        if supplier_urls and not live_supplier_quotes and not params.get("suppliers"):
+            unpriced = ", ".join(
+                str(entry.get("url")) for entry in unpriced_supplier_urls[:3]
+            ) or ", ".join(supplier_urls[:3])
+            return self._refusal(
+                f"None of the supplied supplier URLs declared a price in structured data "
+                f"({unpriced}), so no landed cost could be read from them. Refusing to "
+                f"substitute a simulated cost for pages that were actually requested: "
+                f"point the task at a product page that publishes schema.org/OpenGraph "
+                f"pricing, or supply the quote explicitly.",
+                discovery_result,
+            )
+
         # ── 2. Supplier comparison (landed cost) ───────────────────────────
         supplier_call = tool_registry.execute_tool(
             db,
@@ -374,7 +656,7 @@ class ProductResearchAgent(BaseAgent):
             task_id=task.id,
             agent_type=self.agent_type,
             parameters={
-                "suppliers": params.get("suppliers") or [],
+                "suppliers": supplier_quotes,
                 "reference_price_usd": reference_price,
             },
             context_summary=task.objective,
@@ -394,7 +676,7 @@ class ProductResearchAgent(BaseAgent):
             task_id=task.id,
             agent_type=self.agent_type,
             parameters={
-                "competitors": params.get("competitors") or [],
+                "competitors": competitor_observations,
                 "reference_price_usd": reference_price,
             },
             context_summary=task.objective,
@@ -507,11 +789,34 @@ class ProductResearchAgent(BaseAgent):
             str(supplier_result.get("source") or ""),
             str(competitor_result.get("source") or ""),
         ]
+        if live_result:
+            sources.append(str(live_result.get("source") or ""))
+        if search_result:
+            sources.append(str(search_result.get("source") or ""))
+        # The exact URLs a figure came from - that is what makes a VERIFIED
+        # provenance auditable after the fact.
+        sources.extend(
+            option.source_reference
+            for option in suppliers
+            if option.provenance is DataProvenance.VERIFIED and option.source_reference
+        )
+        sources.extend(
+            entry.source_reference
+            for entry in competitors
+            if entry.provenance is DataProvenance.VERIFIED and entry.source_reference
+        )
         sources.extend(str(item) for item in (params.get("research_sources") or []))
         research_sources = list(dict.fromkeys(source for source in sources if source))
 
         risks = _build_risks(
-            margin=margin, best_supplier=best, demand_provenance=demand_provenance
+            margin=margin,
+            best_supplier=best,
+            demand_provenance=demand_provenance,
+            unpriced_urls=unpriced_supplier_urls + unpriced_competitor_urls,
+            live_quotes_used=any(
+                quote.get("read_from") == "quoted_from_live_page"
+                for quote in supplier_quotes
+            ),
         )
 
         # ── 6. Content: deterministic draft, then facts-only AI rewrite ────
@@ -562,6 +867,27 @@ class ProductResearchAgent(BaseAgent):
         content, content_origin = _merge_content(draft, ai_content, facts)
 
         # ── 7. Validate, persist, report ───────────────────────────────────
+        live_receipt: dict[str, Any] = {}
+        if supplier_urls or competitor_urls or search_result:
+            live_receipt = {
+                "supplier_urls": supplier_urls,
+                "competitor_urls": competitor_urls,
+                "pages": live_raw,
+                "search": {
+                    key: search_result[key]
+                    for key in (
+                        "search_provider",
+                        "search_hits",
+                        "search_error",
+                        "observed_count",
+                    )
+                    if key in search_result
+                },
+                "unpriced_urls": unpriced_supplier_urls + unpriced_competitor_urls,
+                "verified_price_count": int(live_result.get("verified_price_count") or 0),
+                "blocked_urls": list(live_result.get("blocked_urls") or []),
+            }
+
         report = ProductOpportunityReport(
             product_name=product_name,
             product_category=product_category,
@@ -575,6 +901,7 @@ class ProductResearchAgent(BaseAgent):
             research_confidence=confidence,
             recommendation=recommendation,
             generated_content=content,
+            live_research=live_receipt,
         )
         # Re-validate through a JSON round trip: that is how the report is
         # stored and served, so it must survive it unchanged.
@@ -631,6 +958,9 @@ class ProductResearchAgent(BaseAgent):
                 "margins": margins["result"],
                 "opportunity_report": report.model_dump(mode="json"),
                 "content_origin": content_origin,
+                # Same receipt the report carries, so the task payload and the
+                # report can never disagree about what was read.
+                "live_research": live_receipt,
             },
         )
 

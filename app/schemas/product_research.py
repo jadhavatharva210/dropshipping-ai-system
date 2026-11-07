@@ -75,7 +75,13 @@ class OpportunityRecommendation(str, Enum):
 
 
 class SupplierOption(BaseModel):
-    """One sourced supplier quote, with its landed cost already computed."""
+    """One sourced supplier quote, with its landed cost already computed.
+
+    ``source_reference`` is what makes provenance auditable: for a live page it
+    is the URL the price was read from, for a caller quote it is whatever
+    reference the caller gave, and for the offline adapter it names the
+    simulated adapter so a simulated figure can never be mistaken for a quote.
+    """
 
     supplier_name: str = Field(min_length=1)
     unit_cost_usd: float = Field(ge=0)
@@ -268,6 +274,10 @@ class ProductOpportunityReport(BaseModel):
     generated_content: GeneratedProductContent = Field(
         default_factory=GeneratedProductContent
     )
+    #: Live web research receipt: which pages were read, which declared a
+    #: structured price, and which were refused. Empty on the offline path, so
+    #: an offline report is byte-identical to its pre-Phase-3.5 form.
+    live_research: dict[str, Any] = Field(default_factory=dict)
 
     @property
     def best_supplier(self) -> SupplierOption | None:
@@ -378,6 +388,19 @@ class OpportunityReportRequest(BaseModel):
     demand_summary: str | None = None
     demand_provenance: DataProvenance | None = None
     research_sources: list[str] | None = None
+    # ── Live web research (Phase 3.5) ─────────────────────────────────────
+    #: Real supplier product pages to read. Each page's structured price
+    #: (JSON-LD ``Product``/``Offer`` or ``product:price:amount``) becomes a
+    #: ``VERIFIED`` landed-cost quote attributed to that URL; a page with no
+    #: structured price contributes nothing and is listed in the report's risks.
+    supplier_urls: list[str] = Field(default_factory=list)
+    #: Real competitor product pages to read, for observed price points.
+    competitor_urls: list[str] = Field(default_factory=list)
+    #: Ask the live search backend for competitor URLs as well (a no-op when
+    #: ``WEB_SEARCH_PROVIDER=none``).
+    search_competitors: bool = False
+    #: Search terms; defaults to the product name.
+    search_query: str | None = None
 
 
 class OpportunityReportResponse(BaseModel):

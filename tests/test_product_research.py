@@ -1565,6 +1565,30 @@ def test_endpoint_closes_the_provider_it_created(
     from app.api.v1 import research as research_api
 
     recorder = ContentRecorder(content=_grounded_content("LED dog collar"))
+    # An orchestrator that owns its provider, as the default one does: close()
+    # releases the pool the endpoint caused to be created.
+    orchestrator = MainOrchestrator()
+    orchestrator.ai_provider = recorder
+    orchestrator._owns_provider = True
+    monkeypatch.setattr(research_api, "_orchestrator", lambda: orchestrator)
+
+    response = client.post(OPPORTUNITY_REPORT_PATH, json={"product_name": "LED dog collar"})
+    assert response.status_code == 200, response.text
+    assert recorder.closed is True
+
+
+def test_endpoint_never_closes_a_provider_it_did_not_create(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Phase 3.5 ownership rule: an injected provider belongs to its caller.
+
+    The previous endpoint called ``orchestrator.ai_provider.close()``
+    unconditionally, so an injected (shared) provider was closed behind the
+    caller's back. ``with MainOrchestrator(...)`` fixes that.
+    """
+    from app.api.v1 import research as research_api
+
+    recorder = ContentRecorder(content=_grounded_content("LED dog collar"))
     monkeypatch.setattr(
         research_api, "_orchestrator", lambda: MainOrchestrator(ai_provider=recorder)
     )
@@ -1572,10 +1596,13 @@ def test_endpoint_closes_the_provider_it_created(
     assert recorder.closed is False
     response = client.post(OPPORTUNITY_REPORT_PATH, json={"product_name": "LED dog collar"})
     assert response.status_code == 200, response.text
-    assert recorder.closed is True
+    assert recorder.closed is False
+
+    # ...and the provider is still usable afterwards, which is the point.
+    assert recorder.generate_text("still alive") == "recorded summary"
 
 
-def test_endpoint_closes_the_provider_even_when_the_run_fails(
+def test_endpoint_closes_an_owned_provider_even_when_the_run_fails(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from app.api.v1 import research as research_api
@@ -1593,13 +1620,33 @@ def test_endpoint_closes_the_provider_even_when_the_run_fails(
         original_close()
 
     provider.close = _close  # type: ignore[method-assign]
-    monkeypatch.setattr(
-        research_api, "_orchestrator", lambda: MainOrchestrator(ai_provider=provider)
-    )
+    orchestrator = MainOrchestrator()
+    orchestrator.ai_provider = provider
+    orchestrator._owns_provider = True
+    monkeypatch.setattr(research_api, "_orchestrator", lambda: orchestrator)
 
     response = client.post(OPPORTUNITY_REPORT_PATH, json={})
     assert response.status_code == 502
     assert closed == [True]
+
+
+def test_endpoint_leaves_an_injected_provider_open_when_the_run_fails(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.api.v1 import research as research_api
+
+    class ExplodingProvider(MockAIProvider):
+        def generate_structured(self, prompt, schema, context=None):
+            raise RuntimeError("boom")
+
+    provider = ExplodingProvider()
+    orchestrator = MainOrchestrator(ai_provider=provider)
+    monkeypatch.setattr(research_api, "_orchestrator", lambda: orchestrator)
+
+    response = client.post(OPPORTUNITY_REPORT_PATH, json={})
+    assert response.status_code == 502
+    # Never closed - but the provider is still alive and usable.
+    assert provider.generate_text("alive") == "[mock-ai] alive (context keys: none)"
 
 
 # ══════════════════════════════════════════════════════════════════════════

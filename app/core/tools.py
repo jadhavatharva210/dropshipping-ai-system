@@ -26,6 +26,11 @@ from app.schemas.product_research import (
 )
 from app.services.audit import AuditService
 from app.services.memory import SharedMemoryService
+from app.services.web_research import (
+    ExtractedWebProduct,
+    WebResearchError,
+    WebResearchService,
+)
 
 PENDING_NAMESPACE = "orchestrator-pending"
 
@@ -320,9 +325,20 @@ def _compare_supplier_options(parameters: dict[str, Any]) -> dict[str, Any]:
             )
         )
 
+    live_quotes = sum(
+        1
+        for entry in parameters.get("suppliers") or []
+        if isinstance(entry, dict) and entry.get("read_from") == "quoted_from_live_page"
+    )
     note = ""
     if options:
-        source = "caller-supplied supplier quotes"
+        if live_quotes:
+            source = (
+                f"live product pages ({live_quotes} price(s) read from structured "
+                f"JSON-LD/OpenGraph data) plus caller-supplied quotes"
+            )
+        else:
+            source = "caller-supplied supplier quotes"
     else:
         reference = _as_optional_float(parameters.get("reference_price_usd")) or 0.0
         source = SIMULATED_SUPPLIER_ADAPTER
@@ -391,9 +407,20 @@ def _analyze_competitor_landscape(parameters: dict[str, Any]) -> dict[str, Any]:
             )
         )
 
+    live_observations = sum(
+        1
+        for entry in parameters.get("competitors") or []
+        if isinstance(entry, dict) and entry.get("read_from") == "observed_on_live_page"
+    )
     note = ""
     if entries:
-        source = "caller-supplied competitor observations"
+        if live_observations:
+            source = (
+                f"live competitor pages ({live_observations} price(s) read from "
+                f"structured JSON-LD/OpenGraph data) plus caller observations"
+            )
+        else:
+            source = "caller-supplied competitor observations"
     else:
         reference = _as_optional_float(parameters.get("reference_price_usd")) or 0.0
         source = SIMULATED_COMPETITOR_ADAPTER
@@ -889,6 +916,271 @@ def _allocate_ad_budget(parameters: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# ── Phase 3.5: live web research tools (Agent 1) ──────────────────────────
+#
+# These adapters are the only ones that touch the network. They keep the same
+# rule as the offline adapters - never fabricate - but now "don't fabricate"
+# means: if the page did not declare a price in structured data, report no
+# price and say so, rather than scraping a number out of prose.
+
+#: Per-call cap on pages fetched by the live tools. Enough for a real supplier
+#: shortlist, small enough that one task cannot become a crawler.
+MAX_LIVE_PAGES_PER_CALL: int = 10
+
+#: How a live page's price is treated. A structured price is the merchant's own
+#: machine-readable claim and is quoted as VERIFIED; anything else downgrades.
+LIVE_PAGE_ADAPTER = "live_web_research (structured JSON-LD / OpenGraph extraction)"
+
+
+#: Process-wide factory used when a tool call does not carry its own service.
+#: It exists because a ``WebResearchService`` holds an ``httpx.Client`` and
+#: therefore cannot travel through a JSON task payload (which is how the API
+#: reaches the agent). Tests replace it with a factory returning a service built
+#: on ``httpx.MockTransport``; production leaves it alone and each call builds a
+#: service from ``Settings``.
+_web_research_factory: Callable[[], WebResearchService] | None = None
+
+
+def set_web_research_factory(factory: Callable[[], WebResearchService] | None) -> None:
+    """Install (or clear) the default live-research service factory."""
+    global _web_research_factory
+    _web_research_factory = factory
+
+
+def get_web_research_factory() -> Callable[[], WebResearchService]:
+    """The active factory: the installed one, or ``WebResearchService`` itself."""
+    return _web_research_factory or WebResearchService
+
+
+def _live_service(parameters: dict[str, Any]) -> tuple[WebResearchService, bool]:
+    """Resolve the research service for a tool call, and who owns it.
+
+    Three cases, mirroring :class:`MainOrchestrator`'s provider rule:
+
+    * a service injected in the parameters -> the **caller** owns it;
+    * a service from an installed factory -> the **factory owner** owns it, and
+      a long-lived shared service must not be closed behind its owner's back;
+    * no factory installed -> the tool builds one from ``Settings`` and
+      therefore **the tool** owns it, closing it so no ``httpx.Client`` pool
+      leaks per call.
+
+    Returns ``(service, tool_owns_it)``.
+    """
+    injected = parameters.get("web_research_service")
+    if isinstance(injected, WebResearchService):
+        return injected, False
+    if _web_research_factory is not None:
+        return _web_research_factory(), False
+    return WebResearchService(), True
+
+
+def _closed_service(service: WebResearchService, tool_owns_it: bool) -> None:
+    """Close a service this adapter created; leave everyone else's alone."""
+    if tool_owns_it:
+        service.close()
+
+
+def _as_url_list(raw: Any) -> list[str]:
+    """Coerce a URL input into a de-duplicated list of trimmed strings."""
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple, set)):
+        return []
+    ordered: list[str] = []
+    for item in raw:
+        text = str(item).strip()
+        if text and text not in ordered:
+            ordered.append(text)
+    return ordered
+
+
+def _live_supplier_entry(product: ExtractedWebProduct) -> dict[str, Any]:
+    """One extracted page as a supplier-quote candidate.
+
+    A page with a structured price becomes a ``VERIFIED`` quote attributed to
+    its URL. A page without one still reports what it *did* say, at
+    ``ESTIMATED`` and with no price, so the caller can see the page was read
+    rather than ignored - and ``_compare_supplier_options`` will skip it
+    because a quote with no cost carries no information.
+    """
+    return {
+        "supplier_name": product.seller or product.brand or product.product_name or product.url,
+        "unit_cost_usd": product.price_usd,
+        # A retail page price is a landed cost only if the page says so; this
+        # adapter never adds an invented shipping figure.
+        "shipping_cost_usd": 0.0,
+        "shipping_days_min": 0,
+        "shipping_days_max": 0,
+        "in_stock": product.in_stock,
+        "provenance": (
+            DataProvenance.VERIFIED.value
+            if product.has_structured_price
+            else DataProvenance.ESTIMATED.value
+        ),
+        "source_reference": product.source_reference or product.url,
+        "product_name": product.product_name,
+        "description": product.description,
+        "currency": product.currency,
+        "extraction_source": product.extraction_source,
+        "escalation_reason": product.escalation_reason,
+    }
+
+
+def _live_competitor_entry(product: ExtractedWebProduct) -> dict[str, Any]:
+    """One extracted page as a competitor price observation."""
+    return {
+        "competitor_name": product.seller or product.brand or product.product_name or product.url,
+        "observed_price_usd": product.price_usd,
+        "market_positioning": "",
+        "provenance": (
+            DataProvenance.VERIFIED.value
+            if product.has_structured_price
+            else DataProvenance.ESTIMATED.value
+        ),
+        "source_reference": product.source_reference or product.url,
+        "currency": product.currency,
+        "in_stock": product.in_stock,
+        "extraction_source": product.extraction_source,
+        "escalation_reason": product.escalation_reason,
+    }
+
+
+def _fetch_live_product_page(parameters: dict[str, Any]) -> dict[str, Any]:
+    """Read real supplier and competitor product pages from supplied URLs.
+
+    Never invents: an unreadable URL is reported as an error, a page with no
+    structured price is reported as read-but-unpriced, and a blocked URL (SSRF)
+    is reported as blocked. No URL supplied means no request at all.
+    """
+    supplier_urls = _as_url_list(parameters.get("supplier_urls"))
+    competitor_urls = _as_url_list(parameters.get("competitor_urls"))
+    service, tool_owns_it = _live_service(parameters)
+
+    try:
+        supplier_pages, supplier_errors = service.fetch_product_pages(
+            supplier_urls, limit=MAX_LIVE_PAGES_PER_CALL
+        )
+        competitor_pages, competitor_errors = service.fetch_product_pages(
+            competitor_urls, limit=MAX_LIVE_PAGES_PER_CALL
+        )
+    finally:
+        _closed_service(service, tool_owns_it)
+
+    suppliers = [_live_supplier_entry(page) for page in supplier_pages]
+    competitors = [_live_competitor_entry(page) for page in competitor_pages]
+    verified_prices = [entry for entry in suppliers + competitors if entry["provenance"] == "VERIFIED"]
+    unpriced = [page.url for page in supplier_pages + competitor_pages if not page.has_structured_price]
+    blocked = [
+        error["url"] for error in supplier_errors + competitor_errors if error.get("blocked")
+    ]
+
+    requested = len(supplier_urls) + len(competitor_urls)
+    if requested == 0:
+        note = (
+            "No URLs were supplied, so no page was fetched. Nothing was invented to "
+            "fill the gap."
+        )
+    elif not verified_prices:
+        note = (
+            f"Fetched {len(supplier_pages) + len(competitor_pages)} of {requested} page(s), "
+            f"but none declared its price in structured data (JSON-LD or "
+            f"product:price:amount). No price was reported, because scraping one out of "
+            f"prose is a guess, not a quote."
+        )
+    else:
+        note = (
+            f"{len(verified_prices)} of {len(supplier_pages) + len(competitor_pages)} "
+            f"page(s) declared a structured price and are quoted as VERIFIED against "
+            f"their URL."
+        )
+
+    return {
+        "suppliers": suppliers,
+        "competitors": competitors,
+        "supplier_errors": supplier_errors,
+        "competitor_errors": competitor_errors,
+        "pages_fetched": len(supplier_pages) + len(competitor_pages),
+        "verified_price_count": len(verified_prices),
+        "unpriced_urls": unpriced,
+        "blocked_urls": blocked,
+        "source": LIVE_PAGE_ADAPTER,
+        "note": note,
+    }
+
+
+def _search_live_competitors(parameters: dict[str, Any]) -> dict[str, Any]:
+    """Discover candidate competitor URLs and read their structured prices.
+
+    Search itself is optional (``WEB_SEARCH_PROVIDER=none`` by default), so a
+    task never depends on a search backend being configured: with search off,
+    the caller's own ``competitor_urls`` are still read.
+    """
+    query = str(parameters.get("query") or parameters.get("product_name") or "").strip()
+    max_results = int(_as_optional_float(parameters.get("max_results")) or 5)
+    supplied_urls = _as_url_list(parameters.get("competitor_urls"))
+    service, tool_owns_it = _live_service(parameters)
+
+    search_error = ""
+    hits: list[Any] = []
+    try:
+        if query:
+            try:
+                hits = service.search_web_products(query, max_results=max_results)
+            except (WebResearchError, ValueError) as exc:
+                # A search outage must not lose the URLs the caller supplied.
+                search_error = str(exc)
+        discovered = [hit.url for hit in hits]
+        targets = list(dict.fromkeys(supplied_urls + discovered))
+        pages, errors = service.fetch_product_pages(targets, limit=MAX_LIVE_PAGES_PER_CALL)
+    finally:
+        _closed_service(service, tool_owns_it)
+
+    observations = [
+        _live_competitor_entry(page) for page in pages if page.has_structured_price
+    ]
+    unpriced = [
+        {
+            "url": page.url,
+            "reason": page.escalation_reason,
+        }
+        for page in pages
+        if not page.has_structured_price
+    ]
+
+    if not query and not supplied_urls:
+        note = (
+            "No query and no competitor URLs were supplied, so nothing was searched or "
+            "fetched. No competitor price was invented."
+        )
+    elif not observations:
+        note = (
+            "No competitor page declared a structured price, so no observation was "
+            "recorded. An observed price has to be a number the page actually published."
+        )
+    else:
+        note = (
+            f"{len(observations)} competitor price observation(s) read from structured "
+            f"data and attributed to their source URL."
+        )
+
+    return {
+        "observations": observations,
+        "search_hits": [
+            {"url": hit.url, "title": hit.title, "snippet": hit.snippet, "rank": hit.rank}
+            for hit in hits
+        ],
+        "search_provider": service.search_provider,
+        "search_error": search_error,
+        "unpriced_urls": unpriced,
+        "fetch_errors": errors,
+        "observed_count": len(observations),
+        "source": LIVE_PAGE_ADAPTER,
+        "note": note,
+    }
+
+
 def create_default_registry() -> ToolRegistry:
     registry = ToolRegistry()
     registry.register(ToolDefinition(
@@ -931,6 +1223,26 @@ def create_default_registry() -> ToolRegistry:
         description="Draft product listing copy from supplied facts only",
         allowed_agents={AgentType.PRODUCT_RESEARCH},
         handler=_generate_product_content,
+    ))
+    registry.register(ToolDefinition(
+        name="fetch_live_product_page",
+        action_name="research_products",
+        description=(
+            "Fetch real supplier/competitor product pages and extract structured "
+            "prices, stock status and descriptions from JSON-LD / OpenGraph data"
+        ),
+        allowed_agents={AgentType.PRODUCT_RESEARCH},
+        handler=_fetch_live_product_page,
+    ))
+    registry.register(ToolDefinition(
+        name="search_live_competitors",
+        action_name="analyze_competitors",
+        description=(
+            "Search for competitor product pages and record their observed structured "
+            "prices, attributed to each source URL"
+        ),
+        allowed_agents={AgentType.PRODUCT_RESEARCH},
+        handler=_search_live_competitors,
     ))
     registry.register(ToolDefinition(
         name="mock_ad_copy_generator",
