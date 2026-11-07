@@ -8,7 +8,39 @@ SQLite by default, no Docker.
 
 ## Run the demo UI (one command)
 
+> **Windows / PowerShell users: use the Windows block below and nothing else.**
+> The macOS/Linux lines will error on PowerShell (`source` does not exist there).
+
+### Windows (PowerShell) — copy each line separately, press Enter after each
+
+```powershell
+python -m venv .venv
+```
+
+```powershell
+.venv\Scripts\Activate.ps1
+```
+
+If activation is blocked by execution policy, allow it for this session only:
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+```
+
+```powershell
+python -m pip install -r requirements.txt
+```
+
+```powershell
+python demo\run.py
+```
+
+### macOS / Linux (bash, zsh)
+
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
 python demo/run.py
 ```
 
@@ -17,16 +49,19 @@ local SQLite file, the mock AI provider, and search disabled (nothing leaves you
 machine). It also opens a browser tab when it can — `--no-browser` skips that,
 `--port 9000` moves it.
 
-First time only, in the repo root:
+### If a step fails
 
-```bash
-python -m venv .venv
-.venv\Scripts\activate          # Windows
-source .venv/bin/activate       # macOS / Linux
-pip install -r requirements.txt
-```
+| Message | Cause | Fix |
+| --- | --- | --- |
+| `'source' is not recognized` | that line is for macOS/Linux | on Windows use `.venv\Scripts\Activate.ps1` |
+| `Could not open requirements file` | wrong folder, or the `cd` was skipped | `cd` into the folder that has `requirements.txt`, `app\` and `demo\`, then retry |
+| `running scripts is disabled` | PowerShell execution policy | `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass` |
+| `No module named 'demo'` | old copy of `demo/run.py` | update the branch — the launcher adds the repo root to `sys.path` now |
+| `Port 8000 is already in use` | something else is on 8000 | `python demo\run.py --port 8001` |
 
-Then `python demo/run.py` works from any directory.
+The launcher checks its own dependencies on startup and prints the exact install
+command if anything is missing, so a half-finished install is reported clearly
+instead of failing on an import.
 
 ### What you can do there
 
@@ -45,6 +80,21 @@ it drafted from those facts.
 The console never reaches the open internet: it serves four bundled pages under
 `demo-shop.example` through an in-process transport, parsed by the real
 extractor. Details: [docs/DEMO_CONSOLE.md](docs/DEMO_CONSOLE.md).
+
+### Which branch to use
+
+This work lives on the `arena/7669a9c2-dropshipping-ai-system` branch, **not** on
+the repository's default branch (`feat/phase-1a-foundation`), which predates the
+demo console, the README, and live web research. A plain `git clone` gives you
+the default branch. Switch to the branch with the demo before running anything:
+
+```powershell
+git clone https://github.com/jadhavatharva210/dropshipping-ai-system.git
+cd dropshipping-ai-system
+git checkout arena/7669a9c2-dropshipping-ai-system
+```
+
+Then continue with the Windows block above.
 
 ---
 

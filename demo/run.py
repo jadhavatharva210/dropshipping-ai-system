@@ -22,6 +22,7 @@ launches the same ``uvicorn demo.app:app`` you would type by hand.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import os
 import socket
 import sys
@@ -53,6 +54,42 @@ DEFAULTS = {
     "WEB_SEARCH_PROVIDER": "none",
     "SQL_ECHO": "false",
 }
+
+
+#: import name -> the distribution to install. Checked before anything else so a
+#: half-finished `pip install` is reported as such, rather than as a traceback
+#: from somewhere deep inside the app.
+REQUIRED_MODULES = {
+    "fastapi": "fastapi",
+    "uvicorn": "uvicorn[standard]",
+    "sqlalchemy": "sqlalchemy",
+    "pydantic": "pydantic",
+    "pydantic_settings": "pydantic-settings",
+    "httpx": "httpx",
+}
+
+
+def missing_dependencies() -> list[str]:
+    """Distribution names for every required import that is not installed."""
+    return [
+        distribution
+        for module, distribution in REQUIRED_MODULES.items()
+        if importlib.util.find_spec(module) is None
+    ]
+
+
+def _report_missing(missing: list[str]) -> None:
+    print("Cannot start: the Python environment is missing packages.\n", file=sys.stderr)
+    print(f"  interpreter : {sys.executable}", file=sys.stderr)
+    print(f"  missing     : {', '.join(missing)}\n", file=sys.stderr)
+    print("Install them, then run this again:\n", file=sys.stderr)
+    print("  Windows       python -m pip install -r requirements.txt", file=sys.stderr)
+    print("  macOS/Linux   python -m pip install -r requirements.txt\n", file=sys.stderr)
+    print(
+        "If pip cannot find requirements.txt, you are in the wrong folder: cd into\n"
+        "the folder that contains requirements.txt, app\\ and demo\\.",
+        file=sys.stderr,
+    )
 
 
 def _port_is_free(port: int, host: str = "127.0.0.1") -> bool:
@@ -98,6 +135,11 @@ def main(argv: list[str] | None = None) -> int:
     # anything under `app` or `demo` is imported.
     for key, value in DEFAULTS.items():
         os.environ.setdefault(key, value)
+
+    missing = missing_dependencies()
+    if missing:
+        _report_missing(missing)
+        return 1
 
     if not _port_is_free(args.port, "127.0.0.1") and args.host in {"127.0.0.1", "localhost"}:
         print(

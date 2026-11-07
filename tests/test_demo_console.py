@@ -321,3 +321,62 @@ def test_launcher_reports_a_port_already_in_use() -> None:
         port = taken.getsockname()[1]
         assert launcher._port_is_free(port, "127.0.0.1") is False
         assert launcher.main(["--port", str(port), "--no-browser"]) == 1
+
+
+def test_launcher_reports_missing_dependencies_without_a_traceback() -> None:
+    """A half-finished `pip install` must produce instructions, not a traceback."""
+    import subprocess
+    import sys
+
+    from demo.run import REPO_ROOT
+
+    simulate = (
+        "import importlib.util, runpy, sys\n"
+        "real = importlib.util.find_spec\n"
+        "def fake(name, *a, **k):\n"
+        "    return None if name in {'fastapi', 'uvicorn'} else real(name, *a, **k)\n"
+        "importlib.util.find_spec = fake\n"
+        f"sys.path.insert(0, {str(REPO_ROOT)!r})\n"
+        "sys.argv = ['run.py', '--port', '8999', '--no-browser']\n"
+        f"runpy.run_path({str(REPO_ROOT / 'demo' / 'run.py')!r}, run_name='__main__')\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", simulate], capture_output=True, text=True
+    )
+    combined = result.stdout + result.stderr
+    assert result.returncode == 1
+    assert "missing" in combined
+    assert "pip install -r requirements.txt" in combined
+    assert "Traceback" not in combined
+
+
+def test_launcher_dependency_list_covers_every_requirement() -> None:
+    """The preflight must not be narrower than requirements.txt."""
+    from demo.run import REPO_ROOT, REQUIRED_MODULES
+
+    import re
+
+    declared = {
+        re.split(r"[<>=!\[]", line)[0].strip().lower().replace("-", "_")
+        for line in (REPO_ROOT / "requirements.txt").read_text().splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    }
+    # pytest/alembic are tooling, not needed to boot the console.
+    needed = declared - {"pytest", "alembic"}
+    checked = {module.replace("-", "_") for module in REQUIRED_MODULES}
+    assert needed <= checked, f"not checked: {sorted(needed - checked)}"
+
+
+def test_readme_gives_separate_windows_and_unix_instructions() -> None:
+    """The web install once told a PowerShell user to run `source`, which fails."""
+    from demo.run import REPO_ROOT
+
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    windows_block = readme.split("### Windows", 1)[1].split("### macOS", 1)[0]
+    unix_block = readme.split("### macOS", 1)[1].split("Then open", 1)[0]
+
+    assert "Activate.ps1" in windows_block
+    assert "demo\\run.py" in windows_block
+    assert "source" not in windows_block  # the exact command that failed
+    assert "source .venv/bin/activate" in unix_block
+    assert "curl" not in readme.split("### Windows", 1)[1].split("### macOS", 1)[0]
