@@ -116,6 +116,7 @@
       </div>
       <div class="row" style="gap:8px">
         <span class="pill p-grey" id="phase-pill">phase &hellip;</span>
+        <a class="pill p-blue" id="self-link" href="/" title="Open this console in its own tab">open in new tab</a>
         <a class="pill p-blue" href="/docs" target="_blank" rel="noreferrer">API docs</a>
       </div>
     </div>
@@ -189,6 +190,10 @@ let scenarios = {};
 let selected = "happy_path";
 
 async function boot(){
+  // Absolute URL of this page, so "open in new tab" works when the console is
+  // being viewed inside a preview pane (a relative link would reopen the pane).
+  try{ $("self-link").href = window.location.href; }catch(e){}
+
   try{
     const health = await (await fetch("/api/v1/health")).json();
     $("phase-pill").textContent = "phase " + health.architecture_phase + " · " + health.environment;

@@ -31,6 +31,7 @@ from pathlib import Path
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse
 
+from app.core.config import settings
 from app.main import app as production_app
 from app.main import create_app
 from demo.router import DEMO_SCENARIOS, ScenarioSeeder, scenario_of
@@ -43,6 +44,8 @@ __all__ = [
     "mounted_app",
     "route_signature",
 ]
+
+production_app_version = production_app.version
 
 _STATIC = Path(__file__).with_name("static")
 _INDEX = _STATIC / "index.html"
@@ -120,9 +123,15 @@ def _demo_meta() -> dict[str, object]:
             }
             for entry in DEMO_CATALOGUE
         ],
-        # The console cannot reach the internet in most sandboxes, and refuses
-        # to try. Say so in the UI rather than letting a click look broken.
+        # The console's own transport never leaves the machine; say so in the
+        # UI rather than letting a click look broken.
         "offline": True,
+        "runtime": {
+            "environment": settings.app_env,
+            "architecture_phase": production_app_version,
+            "ai_provider": settings.ai_provider,
+            "live_pages": sorted({str(e["url"]) for e in DEMO_CATALOGUE}),
+        },
     }
 
 
@@ -149,9 +158,14 @@ def create_demo_app() -> FastAPI:
     async def _console(request: Request, call_next: object) -> Response:
         path = request.url.path
         if path in {UI_PATH, "/console"}:
-            return HTMLResponse(_INDEX.read_text(encoding="utf-8"))
+            # `no-store`: the preview proxy in front of this server must never
+            # hand back a stale copy of the page after an edit.
+            return HTMLResponse(
+                _INDEX.read_text(encoding="utf-8"),
+                headers={"cache-control": "no-store, max-age=0"},
+            )
         if path == META_PATH:
-            return JSONResponse(_demo_meta())
+            return JSONResponse(_demo_meta(), headers={"cache-control": "no-store"})
         scenario = scenario_of(str(request.url))
         if scenario is not None and scenario not in DEMO_SCENARIOS:
             return JSONResponse(
