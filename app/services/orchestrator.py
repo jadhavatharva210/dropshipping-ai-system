@@ -13,7 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.agents import AgentRegistry, create_default_agent_registry
-from app.core.ai_provider import AIProvider, get_ai_provider
+from app.core.ai_provider import AIProvider, AIRateLimitError, get_ai_provider
 from app.core.enums import AgentType, PermissionLevel, TaskStatus
 from app.core.tools import PENDING_NAMESPACE, ToolRegistry, create_default_registry
 from app.models.core import ApprovalRequest, Task
@@ -262,6 +262,26 @@ class MainOrchestrator:
                 return agent.execute(
                     db, child, self.tool_registry, self.memory, self.ai_provider
                 )
+            except AIRateLimitError as exc:
+                # Rate limit: fail fast, no retry. Free plans cap requests
+                # per day - an immediate retry just burns more quota, and
+                # nothing here may fall back to a paid path.
+                AuditService.log_event(
+                    db,
+                    agent_type=child.assigned_agent,
+                    action_name="agent.execute",
+                    permission_level=child.permission_level,
+                    status="AGENT_RATE_LIMITED",
+                    task_id=child.id,
+                    details={"error": str(exc), "retry_after": exc.retry_after},
+                )
+                child.status = TaskStatus.FAILED
+                child.error_message = (
+                    f"AI provider rate limit reached; workflow stopped "
+                    f"without retrying. {exc}"
+                )
+                db.commit()
+                return None
             except Exception as exc:  # transient runtime failure -> retry
                 AuditService.log_event(
                     db,
